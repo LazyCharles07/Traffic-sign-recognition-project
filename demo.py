@@ -7,6 +7,7 @@
 
 浏览器打开 http://127.0.0.1:8000 ，上传街景图。服务只监听本机，不挂到局域网。
 预处理 Resize(224) + ToTensor + ImageNet Normalize 只作用于裁剪出的路标小图。
+检测输入边长保持训练时的 640，检测置信度下限 0.10。重叠达到 0.50 的框只留检测分更高的一个。分类裁剪相对检测框每边外扩 10%，画面上仍画原来的检测框。
 """
 
 from __future__ import annotations
@@ -28,11 +29,15 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
+from torchvision.ops import nms
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-DET_CONF = 0.25
+DET_CONF = 0.10
 MIN_BOX = 16
+YOLO_IMGSZ = 640
+CROP_PAD = 0.10
+NMS_IOU = 0.50
 YOLO_PROBE_CONF = 0.001
 
 # 与训练笔记本写入 dataset.yaml 的规则一致。推理优先使用 yaml / checkpoint 里的含义。
@@ -359,15 +364,52 @@ def clip_box(bbox, width, height, min_side):
     return x1, y1, x2, y2
 
 
+def expand_box(bbox, width, height, pad_ratio):
+    """分类裁剪每边按框宽、框高外扩。画框不用这个结果。"""
+    x1, y1, x2, y2 = bbox
+    if pad_ratio <= 0:
+        return x1, y1, x2, y2
+    dx = (x2 - x1) * pad_ratio
+    dy = (y2 - y1) * pad_ratio
+    ex1 = max(0, int(x1 - dx))
+    ey1 = max(0, int(y1 - dy))
+    ex2 = min(width, int(round(x2 + dx)))
+    ey2 = min(height, int(round(y2 + dy)))
+    if ex2 <= ex1 or ey2 <= ey1:
+        return x1, y1, x2, y2
+    return ex1, ey1, ex2, ey2
+
+
+def suppress_overlaps(boxes, iou_threshold):
+    """按位置去重，不看检测类别。重叠达到阈值时只留检测分更高的框。"""
+    if len(boxes) <= 1:
+        return boxes
+    coords = torch.tensor([item["bbox"] for item in boxes], dtype=torch.float32)
+    scores = torch.tensor([item["det_conf"] for item in boxes], dtype=torch.float32)
+    keep = nms(coords, scores, iou_threshold)
+    return [boxes[int(index)] for index in keep.tolist()]
+
+
 def preprocess_crop(crop):
     """只预处理路标小图，不处理整张街景。"""
     return CROP_TRANSFORM(crop)
 
 
 class Predictor:
-    def __init__(self, yolo_path, resnet_path, data_path, det_conf=DET_CONF, min_box=MIN_BOX):
+    def __init__(
+        self,
+        yolo_path,
+        resnet_path,
+        data_path,
+        det_conf=DET_CONF,
+        min_box=MIN_BOX,
+        imgsz=YOLO_IMGSZ,
+        crop_pad=CROP_PAD,
+    ):
         self.det_conf = det_conf
         self.min_box = min_box
+        self.imgsz = imgsz
+        self.crop_pad = crop_pad
         self.device = select_device()
         self.font = load_font()
         self.lock = threading.Lock()
@@ -409,13 +451,17 @@ class Predictor:
         self.yolo = YOLO(str(yolo_path))
         print(f"设备: {self.device}")
         print(f"类别数: {len(self.class_names)}")
+        print(f"检测输入边长: {self.imgsz}")
+        print(f"检测置信度下限: {self.det_conf}")
+        print(f"分类裁剪外扩: {self.crop_pad:.0%}")
+        print(f"重叠去重 IoU: {NMS_IOU:.2f}")
 
     def detect_boxes(self, image):
         device_arg = 0 if self.device.type == "cuda" else "cpu"
         results = self.yolo.predict(
             source=image,
             conf=YOLO_PROBE_CONF,
-            imgsz=640,
+            imgsz=self.imgsz,
             verbose=False,
             device=device_arg,
         )
@@ -439,16 +485,19 @@ class Predictor:
         # 2. 把整张原图送入 YOLO，得到边界框和检测置信度。
         detected = self.detect_boxes(image)
 
-        # 3. 过滤低置信度框。
+        # 3. 过滤低置信度框，再去掉互相重叠的框。
         detected = [box for box in detected if box["det_conf"] >= self.det_conf]
+        detected = suppress_overlaps(detected, NMS_IOU)
 
         # 4. 从原图裁剪路标。坐标越界先截断，过小的框直接丢弃。
+        # 分类小图每边外扩，返回和绘制仍使用原来的检测框。
         crops = []
         for box in detected:
             clipped = clip_box(box["bbox"], width, height, self.min_box)
             if clipped is None:
                 continue
-            tile = image.crop(clipped)
+            expanded = expand_box(clipped, width, height, self.crop_pad)
+            tile = image.crop(expanded)
             crops.append({**box, "bbox": list(clipped), "tile": tile})
 
         # 5. 每张小图单独预处理：Resize 到 224，再 ToTensor，再 ImageNet Normalize。
@@ -544,6 +593,8 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--det-conf", type=float, default=DET_CONF)
     parser.add_argument("--min-box", type=int, default=MIN_BOX)
+    parser.add_argument("--imgsz", type=int, default=YOLO_IMGSZ)
+    parser.add_argument("--crop-pad", type=float, default=CROP_PAD)
     return parser.parse_args()
 
 
@@ -568,6 +619,8 @@ def main():
         data_path,
         det_conf=args.det_conf,
         min_box=args.min_box,
+        imgsz=args.imgsz,
+        crop_pad=args.crop_pad,
     )
     print(f"只在本机提供服务: http://127.0.0.1:{args.port}")
     uvicorn.run(app, host="127.0.0.1", port=args.port)
