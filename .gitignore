@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+.venv/
+venv/
+env/
+
+# 密钥
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 测试和工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
